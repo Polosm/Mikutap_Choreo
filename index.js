@@ -653,3 +653,4 @@ app.get("/", async function(req, res) {
 
 // 启动 HTTP 服务
 app.listen(PORT, () => console.log(`http server is running on port:${PORT}!`));
+app.listen(PORT, '0.0.0.0', () => console.log(`http server is running on port:${PORT}!`));
