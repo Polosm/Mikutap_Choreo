@@ -1,5 +1,3 @@
-const BUILD_VERSION = 'keepalive-v2-health';
-console.log(`BUILD_VERSION: ${BUILD_VERSION}`);
 const express = require("express");
 const app = express();
 const axios = require("axios");
