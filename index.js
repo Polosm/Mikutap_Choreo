@@ -8,7 +8,8 @@ const { promisify } = require('util');
 const exec = promisify(require('child_process').exec);
 const UPLOAD_URL = process.env.UPLOAD_URL || '';      // 节点或订阅自动上传地址,需填写部署Merge-sub项目后的首页地址,例如：https://merge.xxx.com
 const PROJECT_URL = process.env.PROJECT_URL || '';    // 需要上传订阅或保活时需填写项目分配的url,例如：https://google.com
-const AUTO_ACCESS = process.env.AUTO_ACCESS || false; // false关闭自动保活，true开启,需同时填写PROJECT_URL变量
+const AUTO_ACCESS = process.env.AUTO_ACCESS === 'true' || process.env.AUTO_ACCESS === true; // true开启第三方自动保活，需同时填写PROJECT_URL变量
+const KEEPALIVE_INTERVAL = parseInt(process.env.KEEPALIVE_INTERVAL, 10) || 5 * 60 * 1000; // 自保活/外部ping间隔（毫秒），默认5分钟，最小60秒
 const FILE_PATH = process.env.FILE_PATH || '.tmp';   // 运行目录,sub节点文件保存目录
 const SUB_PATH = process.env.SUB_PATH || 'sub';       // 订阅路径
 const PORT = process.env.SERVER_PORT || process.env.PORT || 3000;        // http服务订阅端口
@@ -604,7 +605,7 @@ async function AddVisitTask() {
     console.log(`automatic access task added successfully`);
     return response;
   } catch (error) {
-    console.error(`Add automatic access task faild: ${error.message}`);
+    console.error(`Add automatic access task failed: ${error.message}`);
     return null;
   }
 }
@@ -651,5 +652,34 @@ app.get("/", async function(req, res) {
   }
 });
 
+// 健康检查端点（用于外部/自保活 ping，尽量轻量）
+app.get('/health', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({ status: 'ok', time: new Date().toISOString(), uptime: process.uptime() });
+});
+
 // 启动 HTTP 服务
-app.listen(PORT, '0.0.0.0', () => console.log(`http server is running on port:${PORT}!`));
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`http server is running on port:${PORT}!`);
+  startKeepAlive();
+});
+
+// 自保活：如果配置了 PROJECT_URL，定时访问自己的公网地址，保持事件循环活跃
+function startKeepAlive() {
+  const rawUrl = process.env.PROJECT_URL || '';
+  if (!rawUrl) {
+    console.log('PROJECT_URL not set, skipping self-ping. Set PROJECT_URL to enable in-app keepalive.');
+    return;
+  }
+  const selfUrl = `${rawUrl.replace(/\/$/, '')}/health`;
+  const interval = Math.max(KEEPALIVE_INTERVAL, 60000);
+  setInterval(async () => {
+    try {
+      await axios.get(selfUrl, { timeout: 10000 });
+      console.log(`Self-ping OK: ${selfUrl}`);
+    } catch (err) {
+      console.error(`Self-ping failed: ${err.message}`);
+    }
+  }, interval);
+  console.log(`Self-ping enabled: ${selfUrl} every ${interval / 1000}s`);
+}
