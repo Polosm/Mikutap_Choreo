@@ -1,6 +1,10 @@
 # 1. 使用体积小且安全的 Node.js 镜像
 FROM node:18-slim
 
+# 1.5 修复 Choreo Trivy 安全扫描中 libgnutls30 的 Critical 漏洞
+# CVE-2026-33845 / CVE-2026-42010，基础镜像自带旧版，必须显式升级
+RUN apt-get update && apt-get install -y --no-install-recommends libgnutls30 && rm -rf /var/lib/apt/lists/*
+
 # 2. 设置容器内的工作目录
 WORKDIR /home/choreoapp
 
