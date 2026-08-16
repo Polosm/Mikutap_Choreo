@@ -6,6 +6,14 @@ const fs = require("fs");
 const path = require("path");
 const { promisify } = require('util');
 const exec = promisify(require('child_process').exec);
+
+// ==================== 防线1：全局异常兜底（防主进程因未捕获异常 crash）====================
+process.on('uncaughtException', (err) => {
+  console.error(`[uncaughtException] ${err && err.stack ? err.stack : err}`);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error(`[unhandledRejection] ${reason && reason.stack ? reason.stack : reason}`);
+});
 const UPLOAD_URL = process.env.UPLOAD_URL || '';      // 节点或订阅自动上传地址,需填写部署Merge-sub项目后的首页地址,例如：https://merge.xxx.com
 const PROJECT_URL = process.env.PROJECT_URL || '';    // 需要上传订阅或保活时需填写项目分配的url,例如：https://google.com
 const AUTO_ACCESS = process.env.AUTO_ACCESS === 'true' || process.env.AUTO_ACCESS === true; // true开启第三方自动保活，需同时填写PROJECT_URL变量
@@ -179,6 +187,69 @@ function downloadFile(fileName, fileUrl, callback) {
     });
 }
 
+// ==================== 防线2：子进程看门狗（子进程崩溃自动重启）====================
+const supervisedProcs = []; // { name, pattern, startCmd }
+function supervise(name, pattern, startCmd) {
+  const idx = supervisedProcs.findIndex(p => p.name === name);
+  if (idx >= 0) supervisedProcs.splice(idx, 1);
+  supervisedProcs.push({ name, pattern, startCmd });
+}
+async function isAlive(pattern) {
+  try {
+    const { stdout } = await exec(`pgrep -f "${pattern}" 2>/dev/null || true`);
+    return stdout.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+async function watchdog() {
+  for (const p of supervisedProcs) {
+    try {
+      if (!(await isAlive(p.pattern))) {
+        console.log(`[watchdog] ${p.name} not running, restarting...`);
+        await exec(p.startCmd);
+        console.log(`[watchdog] ${p.name} restarted`);
+      }
+    } catch (e) {
+      console.error(`[watchdog] ${p.name} restart failed: ${e.message}`);
+    }
+  }
+}
+async function restartAllProcs(reason) {
+  console.log(`[mem] ${reason}, restarting all subprocesses to free memory`);
+  for (const p of supervisedProcs) {
+    try {
+      await exec(`pkill -f "${p.pattern}" 2>/dev/null || true`);
+      await new Promise(r => setTimeout(r, 1500));
+      await exec(p.startCmd);
+      console.log(`[mem] ${p.name} restarted`);
+    } catch (e) {
+      console.error(`[mem] ${p.name} restart failed: ${e.message}`);
+    }
+  }
+}
+
+// ==================== 防线3：内存自检（容器内存逼近上限时主动重启子进程释放）====================
+const MEMORY_LIMIT_MB = parseInt(process.env.MEMORY_LIMIT_MB, 10) || 420;
+function getContainerMemMB() {
+  try { // cgroup v2
+    return parseInt(fs.readFileSync('/sys/fs/cgroup/memory.current', 'utf8').trim()) / 1024 / 1024;
+  } catch {}
+  try { // cgroup v1
+    return parseInt(fs.readFileSync('/sys/fs/cgroup/memory/memory.usage_in_bytes', 'utf8').trim()) / 1024 / 1024;
+  } catch {}
+  return null;
+}
+async function memCheck() {
+  let mb = getContainerMemMB();
+  const fallback = mb === null;
+  if (fallback) mb = process.memoryUsage().rss / 1024 / 1024;
+  console.log(`[mem] ${fallback ? 'rss' : 'cgroup'}=${mb.toFixed(0)}MB (limit ${MEMORY_LIMIT_MB}MB)`);
+  if (mb > MEMORY_LIMIT_MB && !fallback) {
+    await restartAllProcs(`cgroup mem ${mb.toFixed(0)}MB over ${MEMORY_LIMIT_MB}MB`);
+  }
+}
+
 // 下载并运行依赖文件
 async function downloadFilesAndRun() {  
   
@@ -262,6 +333,7 @@ uuid: ${UUID}`;
       try {
         await exec(command);
         console.log(`${phpName} is running`);
+        supervise('nezha-v1', phpPath, command);
         await new Promise((resolve) => setTimeout(resolve, 1000));
       } catch (error) {
         console.error(`php running error: ${error}`);
@@ -276,6 +348,7 @@ uuid: ${UUID}`;
       try {
         await exec(command);
         console.log(`${npmName} is running`);
+        supervise('nezha-v0', npmPath, command);
         await new Promise((resolve) => setTimeout(resolve, 1000));
       } catch (error) {
         console.error(`npm running error: ${error}`);
@@ -289,6 +362,7 @@ uuid: ${UUID}`;
   try {
     await exec(command1);
     console.log(`${webName} is running`);
+    supervise('xray', webPath, command1);
     await new Promise((resolve) => setTimeout(resolve, 1000));
   } catch (error) {
     console.error(`web running error: ${error}`);
@@ -307,8 +381,10 @@ uuid: ${UUID}`;
     }
 
     try {
-      await exec(`nohup ${botPath} ${args} >/dev/null 2>&1 &`);
+      const botCmd = `nohup ${botPath} ${args} >/dev/null 2>&1 &`;
+      await exec(botCmd);
       console.log(`${botName} is running`);
+      supervise('cloudflared', botPath, botCmd);
       await new Promise((resolve) => setTimeout(resolve, 2000));
     } catch (error) {
       console.error(`Error executing command: ${error}`);
@@ -662,6 +738,12 @@ app.get('/health', (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`http server is running on port:${PORT}!`);
   startKeepAlive();
+  // 防线2：启动子进程看门狗（30s 检查一次，子进程崩了自动拉起）
+  setInterval(watchdog, 30000);
+  console.log('[watchdog] enabled, checking subprocesses every 30s');
+  // 防线3：启动内存自检（60s 一次，逼近上限时主动重启子进程释放）
+  setInterval(memCheck, 60000);
+  console.log(`[mem] monitor enabled, limit ${MEMORY_LIMIT_MB}MB, checking every 60s`);
 });
 
 // 自保活：如果配置了 PROJECT_URL，定时访问自己的公网地址，保持事件循环活跃
