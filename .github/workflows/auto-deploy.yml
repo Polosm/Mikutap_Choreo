@@ -1,0 +1,33 @@
+name: Redeploy Choreo
+
+# 每8小时(UTC 0/8/16点)自动触发 Choreo 重建，约90次/月，卡在免费层100 deployments额度内
+# 作用：兜底防线——即便代码三道防线(异常兜底/看门狗/内存自检)没拦住容器整体OOM/回收，
+#       每8小时也会强制重建一个全新容器，避免长时间断流。
+# 触发条件：Choreo 组件需开启 Auto Deploy on Push（Settings → 自动部署开关）
+
+on:
+  workflow_dispatch:   # 支持手动触发
+  schedule:
+    - cron: '0 */8 * * *'  # 每8小时
+
+jobs:
+  Redeploy:
+    name: Trigger Choreo rebuild
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Update deploy trigger timestamp
+        run: echo "redeploy $(date -u '+%Y-%m-%d %H:%M:%S UTC')" > .deploy-trigger
+
+      - name: Commit and push trigger
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .deploy-trigger
+          git commit -m "chore(redeploy): $(date -u '+%Y-%m-%d %H:%M') UTC" || echo "no changes to commit"
+          git push
