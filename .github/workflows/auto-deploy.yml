@@ -1,33 +1,78 @@
-name: Redeploy Choreo
+name: Choreo Auto-Heal (redeploy only when down)
 
-# 每8小时(UTC 0/8/16点)自动触发 Choreo 重建，约90次/月，卡在免费层100 deployments额度内
-# 作用：兜底防线——即便代码三道防线(异常兜底/看门狗/内存自检)没拦住容器整体OOM/回收，
-#       每8小时也会强制重建一个全新容器，避免长时间断流。
-# 触发条件：Choreo 组件需开启 Auto Deploy on Push（Settings → 自动部署开关）
+# 旧版（auto-deploy.yml.bak.*）是每 8h 无脑 push 空 commit 触发完整 CI 构建，
+# 约 90 次/月，直接吃满 Developer 免费层 100 builds/月 + 100 deployments/月。
+# 新版改成「探测 -> 确认真死 -> 才重建」，健康时零消耗。
+#
+# 前提（Choreo 控制台必须确认，否则本 workflow 推了也不会重建）：
+#   1. Set up 卡片 Auto Build on Commit = 开（官方要求：Auto Deploy on Build 依赖它）
+#   2. Usage/Quota 页面本月 builds / deployments 未耗尽
+#   3. Development 卡片 Deployment Status 不是 Suspended；若是，先手动 Re-deploy 一次
 
 on:
-  workflow_dispatch:   # 支持手动触发
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '跳过健康自检，强制触发一次重建'
+        type: boolean
+        default: false
   schedule:
-    - cron: '0 */8 * * *'  # 每8小时
+    - cron: '*/30 * * * *'   # 巡检兜底；GitHub cron 实际会延迟，配合 Kuma 60s ping 使用
+
+permissions:
+  contents: write
+
+concurrency:
+  group: choreo-redeploy
+  cancel-in-progress: false
 
 jobs:
-  Redeploy:
-    name: Trigger Choreo rebuild
+  check-and-redeploy:
+    name: Probe health, redeploy only if dead
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
+      - name: Probe /health (3 tries, tolerate cold start)
+        id: probe
+        run: |
+          URL="https://75c886fb-1f37-4b50-bdc2-430818de1b4c-dev.e1-eu-north-azure.choreoapis.dev/default/mikutap-vcc/v1.0/health"
+          healthy=0
+          for i in 1 2 3; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 25 "$URL" || echo 000)
+            echo "probe $i -> HTTP $code"
+            if [ "$code" = "200" ]; then healthy=1; break; fi
+            sleep 20
+          done
+          echo "healthy=$healthy" >> "$GITHUB_OUTPUT"
+          echo "forced=${{ github.event_name == 'workflow_dispatch' && inputs.force == true }}" >> "$GITHUB_OUTPUT"
+
+      - name: Healthy - no action, zero quota burned
+        if: steps.probe.outputs.healthy == '1' && steps.probe.outputs.forced != 'true'
+        run: echo "Component healthy. Skip rebuild."
+
       - uses: actions/checkout@v4
+        if: steps.probe.outputs.healthy != '1' || steps.probe.outputs.forced == 'true'
         with:
-          fetch-depth: 1
+          fetch-depth: 20
 
-      - name: Update deploy trigger timestamp
-        run: echo "redeploy $(date -u '+%Y-%m-%d %H:%M:%S UTC')" > .deploy-trigger
+      - name: Cooldown (no more than 1 rebuild per 30 min)
+        id: cooldown
+        if: steps.probe.outputs.healthy != '1' || steps.probe.outputs.forced == 'true'
+        run: |
+          last=$(git log -1 --format=%ct --grep='chore(redeploy)' || true)
+          now=$(date +%s)
+          if [ -n "$last" ] && [ $((now - last)) -lt 1800 ]; then
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+            echo "Cooldown active, last rebuild $((now - last))s ago. Skip."
+          else
+            echo "skip=0" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Commit and push trigger
+      - name: Push trigger commit to force Choreo rebuild
+        if: (steps.probe.outputs.healthy != '1' || steps.probe.outputs.forced == 'true') && steps.cooldown.outputs.skip == '0'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          echo "redeploy $(date -u '+%Y-%m-%d %H:%M:%S UTC') auto-heal" > .deploy-trigger
           git add .deploy-trigger
-          git commit -m "chore(redeploy): $(date -u '+%Y-%m-%d %H:%M') UTC" || echo "no changes to commit"
+          git commit -m "chore(redeploy): $(date -u '+%Y-%m-%d %H:%M') UTC auto-heal"
           git push
